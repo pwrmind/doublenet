@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <title>ML RL: Double DQN + 2-way radars</title>
+    <title>ML RL: минимальные сенсоры (IMU + CoM)</title>
     <style>
         body { margin: 0; overflow: hidden; background: #1a1a1a; font-family: sans-serif; color: #fff; }
         canvas { display: block; }
@@ -21,6 +21,16 @@
         .btn:hover { background: #555; }
         .btn.active { background: #4caf50; border-color: #81c784; }
         .stats-text { font-family: monospace; font-size: 12px; margin-top: 10px; line-height: 1.5; }
+        #sensor-panel {
+            position: absolute; top: 15px; right: 15px;
+            background: rgba(0,0,0,0.85); padding: 12px;
+            border-radius: 8px; border: 1px solid #444; z-index: 10;
+            font-family: monospace; font-size: 12px; line-height: 1.6;
+            min-width: 220px;
+        }
+        #sensor-panel h4 { margin: 0 0 8px 0; font-size: 13px; color: #33ccff; }
+        .bar { display: inline-block; height: 8px; background: #33ccff; vertical-align: middle; }
+        .bar-track { display: inline-block; width: 80px; height: 8px; background: #333; vertical-align: middle; margin: 0 4px; }
         #chart-container {
             position: absolute; bottom: 15px; left: 15px;
             background: rgba(0,0,0,0.85); padding: 10px;
@@ -36,7 +46,7 @@
 <body>
 
 <div id="ui-panel">
-    <h3>Управление Средой (Concept Drift)</h3>
+    <h3>Управление Средой</h3>
     <button id="btn-easy" class="btn active" onclick="changeEnvironment('easy')">Плавные холмы</button>
     <button id="btn-hard" class="btn" onclick="changeEnvironment('hard')">Острые скалы</button>
     <div class="stats-text">
@@ -44,9 +54,20 @@
         <div>Эпизод: <span id="stat-episode">0</span></div>
         <div>Эпсилон: <span id="stat-epsilon">1.00</span></div>
         <div>Награда: <span id="stat-reward">0.00</span></div>
-        <div>KL (max front/back): <span id="stat-kl">0.00</span></div>
+        <div>KL (min): <span id="stat-kl">0.00</span></div>
         <div id="stat-status" style="margin-top:5px; color:#aaa;">Сбор базового эталона...</div>
     </div>
+</div>
+
+<div id="sensor-panel">
+    <h4>📡 7-канальный сенсор</h4>
+    <div>vx <span class="bar-track"><span id="b-vx" class="bar" style="width:40px"></span></span> <span id="s-vx">0.00</span></div>
+    <div>vy <span class="bar-track"><span id="b-vy" class="bar" style="width:40px"></span></span> <span id="s-vy">0.00</span></div>
+    <div>tilt <span class="bar-track"><span id="b-tilt" class="bar" style="width:40px"></span></span> <span id="s-tilt">0.00</span></div>
+    <div>ω <span class="bar-track"><span id="b-om" class="bar" style="width:40px"></span></span> <span id="s-om">0.00</span></div>
+    <div>ax <span class="bar-track"><span id="b-ax" class="bar" style="width:40px"></span></span> <span id="s-ax">0.00</span></div>
+    <div>ay <span class="bar-track"><span id="b-ay" class="bar" style="width:40px"></span></span> <span id="s-ay">0.00</span></div>
+    <div>com <span class="bar-track"><span id="b-com" class="bar" style="width:40px"></span></span> <span id="s-com">0.00</span></div>
 </div>
 
 <div id="chart-container">
@@ -105,8 +126,7 @@ function updateTrack(carX) {
     for (let i = startIdx; i <= endIdx; i++) {
         if (!trackSegments.has(i)) {
             const x = i * SEGMENT_WIDTH + SEGMENT_WIDTH / 2;
-            const y1 = getTerrainHeight(i);
-            const y2 = getTerrainHeight(i + 1);
+            const y1 = getTerrainHeight(i), y2 = getTerrainHeight(i + 1);
             const angle = Math.atan2(y2 - y1, SEGMENT_WIDTH);
             const midY = (y1 + y2) / 2;
             const seg = Bodies.rectangle(x, midY + SEGMENT_THICKNESS / 2, SEGMENT_WIDTH + 2, SEGMENT_THICKNESS, {
@@ -117,14 +137,9 @@ function updateTrack(carX) {
             Composite.add(world, seg);
         }
     }
-    const toDelete = [];
-    for (let [index] of trackSegments.entries()) {
-        if (index < startIdx || index > endIdx) toDelete.push(index);
-    }
-    for (let index of toDelete) {
-        Composite.remove(world, trackSegments.get(index));
-        trackSegments.delete(index);
-    }
+    const toDel = [];
+    for (let [i] of trackSegments.entries()) if (i < startIdx || i > endIdx) toDel.push(i);
+    for (let i of toDel) { Composite.remove(world, trackSegments.get(i)); trackSegments.delete(i); }
 }
 
 // === МАШИНА ===
@@ -140,63 +155,82 @@ function createCar(x, y) {
     const wheelB = Bodies.circle(x + carWidth / 2 - 10, y + carHeight / 2, wheelRadius, {
         collisionFilter: { group: carGroup }, friction: 0.9, render: { fillStyle: '#333' }
     });
-    const springA = Constraint.create({
+    const sA = Constraint.create({
         bodyA: chassis, pointA: { x: -carWidth / 2 + 10, y: carHeight / 2 },
         bodyB: wheelA, stiffness: 0.4, render: { strokeStyle: '#fff', lineWidth: 1 }
     });
-    const springB = Constraint.create({
+    const sB = Constraint.create({
         bodyA: chassis, pointA: { x: carWidth / 2 - 10, y: carHeight / 2 },
         bodyB: wheelB, stiffness: 0.4, render: { strokeStyle: '#fff', lineWidth: 1 }
     });
-    Composite.add(world, [chassis, wheelA, wheelB, springA, springB]);
+    Composite.add(world, [chassis, wheelA, wheelB, sA, sB]);
     return { chassis, wheelA, wheelB };
 }
 const car = createCar(100, getTerrainHeight(0) - 100);
 
-// === УТИЛИТЫ ===
 const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
 
-function raySegIntersect(px, py, dx, dy, ax, ay, bx, by) {
-    const ex = bx - ax, ey = by - ay;
-    const det = dy * ex - dx * ey;
-    if (Math.abs(det) < 1e-10) return -1;
-    const t = ((px - ax) * ey + (ay - py) * ex) / det;
-    const u = (dx * (ay - py) - dy * (ax - px)) / det;
-    if (t >= 0 && u >= 0 && u <= 1) return t;
-    return -1;
+// === МИНИМАЛЬНЫЙ СЕНСОРНЫЙ ВЕКТОР (7) ===
+let prevVxW = null, prevVyW = null;
+let axEMA = 0, ayEMA = 0;
+const EMA_ALPHA = 0.25;
+
+function resetSensorHistory() {
+    prevVxW = null; prevVyW = null;
+    axEMA = 0; ayEMA = 0;
 }
 
-// === STATE (теперь 16 элементов: 6 физика + 5 передних + 5 задних) ===
-function getStateVector(car, radarInputs, trackSegments) {
+function getMinimalState(car) {
     const c = car.chassis;
-    const velocityX = clamp(c.velocity.x / 20, -1, 1);
-    const velocityY = clamp(c.velocity.y / 20, -1, 1);
-    const normAngle = clamp(c.angle / Math.PI, -1, 1);
-    const angularVelocity = clamp(c.angularVelocity / 0.5, -1, 1);
-    const roadBodies = Array.from(trackSegments.values());
-    const contactA = Matter.Query.collides(car.wheelA, roadBodies).length > 0 ? 1.0 : 0.0;
-    const contactB = Matter.Query.collides(car.wheelB, roadBodies).length > 0 ? 1.0 : 0.0;
-    return [velocityX, velocityY, normAngle, angularVelocity, contactA, contactB, ...radarInputs];
+    if (prevVxW === null) { prevVxW = c.velocity.x; prevVyW = c.velocity.y; }
+    const axW = c.velocity.x - prevVxW;
+    const ayW = c.velocity.y - prevVyW;
+    prevVxW = c.velocity.x; prevVyW = c.velocity.y;
+    
+    const cosA = Math.cos(c.angle), sinA = Math.sin(c.angle);
+    const vxB =  cosA * c.velocity.x + sinA * c.velocity.y;
+    const vyB = -sinA * c.velocity.x + cosA * c.velocity.y;
+    const axB =  cosA * axW + sinA * ayW;
+    const ayB = -sinA * axW + cosA * ayW;
+    
+    // EMA как low-pass фильтр реального IMU
+    axEMA = EMA_ALPHA * axB + (1 - EMA_ALPHA) * axEMA;
+    ayEMA = EMA_ALPHA * ayB + (1 - EMA_ALPHA) * ayEMA;
+    
+    // CoM offset от опорной базы (в СК кузова)
+    const wmx = (car.wheelA.position.x + car.wheelB.position.x) * 0.5;
+    const wmy = (car.wheelA.position.y + car.wheelB.position.y) * 0.5;
+    const offX = c.position.x - wmx, offY = c.position.y - wmy;
+    const comOffB = cosA * offX + sinA * offY;
+    
+    return [
+        clamp(vxB / 10, -1, 1),
+        clamp(vyB / 10, -1, 1),
+        clamp(c.angle / Math.PI, -1, 1),
+        clamp(c.angularVelocity / 0.3, -1, 1),
+        clamp(axEMA / 1.0, -1, 1),
+        clamp(ayEMA / 1.0, -1, 1),
+        clamp(comOffB / 30, -1, 1),
+    ];
 }
 
 // === REWARD ===
 function calculateReward(car, contactA, contactB) {
     const c = car.chassis;
-    let reward = 0;
-    if (c.velocity.x > 0) reward += c.velocity.x * 0.1;
-    else reward -= 0.1;
-    let angle = c.angle % (Math.PI * 2);
-    if (angle > Math.PI) angle -= Math.PI * 2;
-    if (angle < -Math.PI) angle += Math.PI * 2;
-    const absAngle = Math.abs(angle);
-    if (absAngle > 1.3) reward -= (absAngle - 1.3) * 3.0;
-    if (absAngle > 2.5) reward -= 7.0;
-    if (contactA > 0 || contactB > 0) reward += 0.1;
-    if (contactA > 0 && contactB > 0) reward += 0.15;
-    return clamp(reward, -10, 10);
+    let r = 0;
+    if (c.velocity.x > 0) r += c.velocity.x * 0.1; else r -= 0.1;
+    let a = c.angle % (Math.PI * 2);
+    if (a > Math.PI) a -= Math.PI * 2;
+    if (a < -Math.PI) a += Math.PI * 2;
+    const aa = Math.abs(a);
+    if (aa > 1.3) r -= (aa - 1.3) * 3.0;
+    if (aa > 2.5) r -= 7.0;
+    if (contactA > 0 || contactB > 0) r += 0.1;
+    if (contactA > 0 && contactB > 0) r += 0.15;
+    return clamp(r, -10, 10);
 }
 
-// === ДЕТЕКТОР ДРЕЙФА (3 признака: front-avg, back-avg, reward) ===
+// === ДЕТЕКТОР ДРЕЙФА (теперь смотрит на ax и tilt) ===
 class ConceptDriftDetector {
     constructor(threshold = 1.5) {
         this.threshold = threshold;
@@ -204,12 +238,9 @@ class ConceptDriftDetector {
         this.REF_MAX_SIZE = 800; this.CUR_MAX_SIZE = 120;
         this.isStable = false; this.lastKL = 0;
     }
-    update(stateVector, reward) {
-        // Вектор: [0..5] физика, [6..10] передние радары, [11..15] задние
-        let frontSum = 0, backSum = 0;
-        for (let i = 6; i <= 10; i++) frontSum += stateVector[i];
-        for (let i = 11; i <= 15; i++) backSum += stateVector[i];
-        const features = [frontSum / 5, backSum / 5, reward];
+    update(state, reward) {
+        // state: [vx, vy, tilt, ω, ax, ay, com] → фичи: ax, tilt, reward
+        const features = [state[4], state[2], reward];
         this.currentWindow.push(features);
         if (this.currentWindow.length > this.CUR_MAX_SIZE) this.currentWindow.shift();
         if (!this.isStable) {
@@ -217,38 +248,31 @@ class ConceptDriftDetector {
             if (this.referenceWindow.length >= this.REF_MAX_SIZE) {
                 this.isStable = true;
                 const el = document.getElementById('stat-status');
-                el.innerText = "✅ Базовый профиль готов";
-                el.style.color = "#4caf50";
+                el.innerText = "✅ Базовый профиль готов"; el.style.color = "#4caf50";
             }
             return false;
         }
         return this.checkDrift();
     }
-    getStats(windowData, featureIdx) {
-        if (windowData.length === 0) return { mean: 0, sigma: 1 };
-        const values = windowData.map(d => d[featureIdx]);
-        const mean = values.reduce((a, b) => a + b, 0) / values.length;
-        const variance = values.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / values.length;
+    getStats(win, idx) {
+        if (!win.length) return { mean: 0, sigma: 1 };
+        const vals = win.map(d => d[idx]);
+        const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+        const variance = vals.reduce((a, b) => a + (b - mean) ** 2, 0) / vals.length;
         return { mean, sigma: Math.sqrt(variance) + 1e-5 };
     }
-    _klNormal(ref, cur) {
-        let kl = Math.log(cur.sigma / ref.sigma) +
-                 (ref.sigma ** 2 + (ref.mean - cur.mean) ** 2) / (2 * cur.sigma ** 2) - 0.5;
-        return (isFinite(kl) && kl > 0) ? kl : 0;
+    _kl(ref, cur) {
+        let k = Math.log(cur.sigma / ref.sigma) + (ref.sigma ** 2 + (ref.mean - cur.mean) ** 2) / (2 * cur.sigma ** 2) - 0.5;
+        return (isFinite(k) && k > 0) ? k : 0;
     }
     checkDrift() {
-        const refF = this.getStats(this.referenceWindow, 0);
-        const curF = this.getStats(this.currentWindow, 0);
-        const refB = this.getStats(this.referenceWindow, 1);
-        const curB = this.getStats(this.currentWindow, 1);
-        const klF = this._klNormal(refF, curF);
-        const klB = this._klNormal(refB, curB);
-        this.lastKL = Math.max(klF, klB);
-        const refRw = this.getStats(this.referenceWindow, 2);
-        const curRw = this.getStats(this.currentWindow, 2);
-        const klTrigger = this.lastKL > this.threshold;
-        const rewardTrigger = refRw.mean > 0.5 && curRw.mean < refRw.mean * 0.4;
-        if (klTrigger || rewardTrigger) return true;
+        const klAx = this._kl(this.getStats(this.referenceWindow, 0), this.getStats(this.currentWindow, 0));
+        const klTilt = this._kl(this.getStats(this.referenceWindow, 1), this.getStats(this.currentWindow, 1));
+        this.lastKL = Math.max(klAx, klTilt);
+        const refR = this.getStats(this.referenceWindow, 2);
+        const curR = this.getStats(this.currentWindow, 2);
+        const rewardTrigger = refR.mean > 0.5 && curR.mean < refR.mean * 0.4;
+        if (this.lastKL > this.threshold || rewardTrigger) return true;
         if (this.referenceWindow.length >= this.REF_MAX_SIZE) this.referenceWindow.shift();
         this.referenceWindow.push(this.currentWindow[this.currentWindow.length - 1]);
         return false;
@@ -257,25 +281,21 @@ class ConceptDriftDetector {
         this.referenceWindow = []; this.currentWindow = [];
         this.isStable = false; this.lastKL = 0;
         const el = document.getElementById('stat-status');
-        el.innerText = "🔄 Детекция! Новый эталон...";
-        el.style.color = "#ff9800";
+        el.innerText = "🔄 Детекция! Новый эталон..."; el.style.color = "#ff9800";
     }
 }
 
-// === DOUBLE DQN (16 входов, hidden=32) ===
+// === DOUBLE DQN (7 входов) ===
 class FirstNetworkDQN {
-    constructor(inputSize = 16, hiddenSize = 32, actionSize = 3) {
+    constructor(inputSize = 7, hiddenSize = 24, actionSize = 3) {
         this.inputSize = inputSize; this.hiddenSize = hiddenSize; this.actionSize = actionSize;
         this.gamma = 0.95; this.epsilon = 1.0; this.epsilonMin = 0.03;
         this.epsilonDecay = 0.9995; this.lr = 0.01;
-        const lim1 = Math.sqrt(6 / inputSize), lim2 = Math.sqrt(6 / hiddenSize);
-        this.W1 = Array.from({length: inputSize}, () =>
-            Array.from({length: hiddenSize}, () => (Math.random() * 2 - 1) * lim1));
+        const l1 = Math.sqrt(6 / inputSize), l2 = Math.sqrt(6 / hiddenSize);
+        this.W1 = Array.from({length: inputSize}, () => Array.from({length: hiddenSize}, () => (Math.random() * 2 - 1) * l1));
         this.b1 = new Array(hiddenSize).fill(0);
-        this.W2 = Array.from({length: hiddenSize}, () =>
-            Array.from({length: actionSize}, () => (Math.random() * 2 - 1) * lim2));
+        this.W2 = Array.from({length: hiddenSize}, () => Array.from({length: actionSize}, () => (Math.random() * 2 - 1) * l2));
         this.b2 = new Array(actionSize).fill(0);
-        // Target network (копия)
         this.W1t = this.W1.map(r => [...r]); this.b1t = [...this.b1];
         this.W2t = this.W2.map(r => [...r]); this.b2t = [...this.b2];
         this.stepsSinceSync = 0; this.SYNC_EVERY = 200;
@@ -287,8 +307,7 @@ class FirstNetworkDQN {
         for (let i = 0; i < this.hiddenSize; i++) {
             let v = this.b1[i];
             for (let j = 0; j < this.inputSize; j++) v += s[j] * this.W1[j][i];
-            this._h_pre[i] = v;
-            this._h[i] = v > 0 ? v : 0;
+            this._h_pre[i] = v; this._h[i] = v > 0 ? v : 0;
         }
         const q = new Array(this.actionSize);
         for (let a = 0; a < this.actionSize; a++) {
@@ -316,9 +335,9 @@ class FirstNetworkDQN {
     act(s) {
         if (Math.random() < this.epsilon) return Math.floor(Math.random() * this.actionSize);
         const q = this._forward(s);
-        let best = 0;
-        for (let a = 1; a < this.actionSize; a++) if (q[a] > q[best]) best = a;
-        return best;
+        let b = 0;
+        for (let a = 1; a < this.actionSize; a++) if (q[a] > q[b]) b = a;
+        return b;
     }
     remember(s, a, r, ns) {
         this.memory.push({ state: [...s], action: a, reward: r, nextState: [...ns] });
@@ -326,37 +345,25 @@ class FirstNetworkDQN {
     }
     train() {
         if (this.memory.length < this.BATCH_SIZE) return;
-        for (let b = 0; b < this.BATCH_SIZE; b++) {
-            const { state, action, reward, nextState } =
-                this.memory[Math.floor(Math.random() * this.memory.length)];
-
-            // === DOUBLE DQN ===
-            // 1) Основная сеть выбирает лучшее действие
-            const nextQOnline = this._forward(nextState);
-            let bestNextAction = 0;
-            for (let a = 1; a < this.actionSize; a++) {
-                if (nextQOnline[a] > nextQOnline[bestNextAction]) bestNextAction = a;
-            }
-            // 2) Target сеть оценивает это действие
-            const nextQTarget = this._forwardTarget(nextState);
-            const target = reward + this.gamma * nextQTarget[bestNextAction];
-
-            // 3) Прямой проход текущей сети (кэширует _h, _h_pre для state)
+        for (let i = 0; i < this.BATCH_SIZE; i++) {
+            const { state, action, reward, nextState } = this.memory[Math.floor(Math.random() * this.memory.length)];
+            // Double DQN
+            const nqOnline = this._forward(nextState);
+            let bestNext = 0;
+            for (let a = 1; a < this.actionSize; a++) if (nqOnline[a] > nqOnline[bestNext]) bestNext = a;
+            const nqTarget = this._forwardTarget(nextState);
+            const target = reward + this.gamma * nqTarget[bestNext];
             const q = this._forward(state);
             let error = clamp(target - q[action], -1, 1);
             if (!isFinite(error)) continue;
-
-            // 4) Backprop
             const dh = new Array(this.hiddenSize);
-            for (let i = 0; i < this.hiddenSize; i++)
-                dh[i] = error * this.W2[i][action] * (this._h_pre[i] > 0 ? 1 : 0);
-            for (let i = 0; i < this.hiddenSize; i++)
-                this.W2[i][action] += this.lr * error * this._h[i];
+            for (let j = 0; j < this.hiddenSize; j++)
+                dh[j] = error * this.W2[j][action] * (this._h_pre[j] > 0 ? 1 : 0);
+            for (let j = 0; j < this.hiddenSize; j++) this.W2[j][action] += this.lr * error * this._h[j];
             this.b2[action] += this.lr * error;
-            for (let i = 0; i < this.hiddenSize; i++) {
-                for (let j = 0; j < this.inputSize; j++)
-                    this.W1[j][i] += this.lr * dh[i] * state[j];
-                this.b1[i] += this.lr * dh[i];
+            for (let j = 0; j < this.hiddenSize; j++) {
+                for (let k = 0; k < this.inputSize; k++) this.W1[k][j] += this.lr * dh[j] * state[k];
+                this.b1[j] += this.lr * dh[j];
             }
         }
         if (this.epsilon > this.epsilonMin) this.epsilon *= this.epsilonDecay;
@@ -390,7 +397,7 @@ function updateLiveChart(kl, reward) {
     chartCtx.clearRect(0, 0, chartCanvas.width, chartCanvas.height);
     const thY = chartCanvas.height - 15 - 1.5 * 18;
     chartCtx.beginPath(); chartCtx.strokeStyle = 'rgba(255,0,0,0.35)';
-    chartCtx.setLineDash([4,4]); chartCtx.moveTo(0, thY); chartCtx.lineTo(chartCanvas.width, thY);
+    chartCtx.setLineDash([4, 4]); chartCtx.moveTo(0, thY); chartCtx.lineTo(chartCanvas.width, thY);
     chartCtx.stroke(); chartCtx.setLineDash([]);
     chartCtx.beginPath(); chartCtx.strokeStyle = '#ff3333'; chartCtx.lineWidth = 2;
     for (let i = 0; i < driftHistory.length; i++) {
@@ -409,95 +416,45 @@ function updateLiveChart(kl, reward) {
 // === ЭПИЗОДЫ ===
 let episode = 0, flippedFrames = 0, stuckFrames = 0, frameCounter = 0;
 function respawnCar() {
-    const newX = car.chassis.position.x + 100;
-    const newY = getTerrainHeight(Math.floor(newX / SEGMENT_WIDTH)) - 150;
-    Body.setPosition(car.chassis, { x: newX, y: newY });
+    const nx = car.chassis.position.x + 100;
+    const ny = getTerrainHeight(Math.floor(nx / SEGMENT_WIDTH)) - 150;
+    Body.setPosition(car.chassis, { x: nx, y: ny });
     Body.setVelocity(car.chassis, { x: 0, y: 0 });
     Body.setAngularVelocity(car.chassis, 0);
     Body.setAngle(car.chassis, 0);
-    Body.setPosition(car.wheelA, { x: newX - 35, y: newY + 35 });
-    Body.setPosition(car.wheelB, { x: newX + 35, y: newY + 35 });
+    Body.setPosition(car.wheelA, { x: nx - 35, y: ny + 35 });
+    Body.setPosition(car.wheelB, { x: nx + 35, y: ny + 35 });
     Body.setVelocity(car.wheelA, { x: 0, y: 0 });
     Body.setVelocity(car.wheelB, { x: 0, y: 0 });
     Body.setAngularVelocity(car.wheelA, 0);
     Body.setAngularVelocity(car.wheelB, 0);
+    resetSensorHistory();
     flippedFrames = 0; stuckFrames = 0; episode++;
 }
-
-// === РАДАРЫ ===
-const FRONT_RADAR_COUNT = 5;
-const BACK_RADAR_COUNT = 5;
-const RADAR_LENGTH = 280;
-const RADAR_FOV = 60;
-const FOV_RAD = RADAR_FOV * Math.PI / 180;
 
 // === ИГРОВОЙ ЦИКЛ ===
 Matter.Events.on(engine, 'afterUpdate', () => {
     const carX = car.chassis.position.x, carY = car.chassis.position.y;
-    const carAngle = car.chassis.angle;
     updateTrack(carX);
     Render.lookAt(render, {
         min: { x: carX - window.innerWidth / 2, y: carY - window.innerHeight * 0.7 },
         max: { x: carX + window.innerWidth / 2, y: carY + window.innerHeight * 0.3 }
     });
 
-    // === RAYCAST: 5 передних + 5 задних ===
-    const radarInputs = [];
-    const context = render.context;
-    Render.startViewTransform(render);
+    // State + Reward
+    const state = getMinimalState(car);
+    const roadBodies = Array.from(trackSegments.values());
+    const cA = Matter.Query.collides(car.wheelA, roadBodies).length > 0 ? 1 : 0;
+    const cB = Matter.Query.collides(car.wheelB, roadBodies).length > 0 ? 1 : 0;
+    const reward = calculateReward(car, cA, cB);
 
-    const castRay = (angle) => {
-        const dx = Math.cos(angle), dy = Math.sin(angle);
-        let minFrac = 1.0;
-        for (let seg of trackSegments.values()) {
-            const verts = seg.vertices;
-            for (let k = 0; k < verts.length; k++) {
-                const a = verts[k], b = verts[(k + 1) % verts.length];
-                const t = raySegIntersect(carX, carY, dx, dy, a.x, a.y, b.x, b.y);
-                if (t >= 0 && t < minFrac * RADAR_LENGTH) minFrac = t / RADAR_LENGTH;
-            }
-        }
-        return { frac: minFrac, dx, dy };
-    };
-
-    // Передние: carAngle + spread + tilt_down
-    for (let i = 0; i < FRONT_RADAR_COUNT; i++) {
-        const local = (i / (FRONT_RADAR_COUNT - 1) - 0.5) * FOV_RAD;
-        const angle = carAngle + local + Math.PI / 6;
-        const { frac, dx, dy } = castRay(angle);
-        radarInputs.push(frac);
-        const ex = carX + dx * frac * RADAR_LENGTH;
-        const ey = carY + dy * frac * RADAR_LENGTH;
-        context.beginPath(); context.moveTo(carX, carY); context.lineTo(ex, ey);
-        context.strokeStyle = frac < 1 ? 'rgba(255,80,80,0.5)' : 'rgba(80,255,80,0.12)';
-        context.lineWidth = 1.5; context.stroke();
-    }
-
-    // Задние: carAngle + π − spread − tilt_down (зеркальное отражение)
-    for (let i = 0; i < BACK_RADAR_COUNT; i++) {
-        const local = (i / (BACK_RADAR_COUNT - 1) - 0.5) * FOV_RAD;
-        const angle = carAngle + Math.PI - local - Math.PI / 6;
-        const { frac, dx, dy } = castRay(angle);
-        radarInputs.push(frac);
-        const ex = carX + dx * frac * RADAR_LENGTH;
-        const ey = carY + dy * frac * RADAR_LENGTH;
-        context.beginPath(); context.moveTo(carX, carY); context.lineTo(ex, ey);
-        context.strokeStyle = frac < 1 ? 'rgba(80,160,255,0.5)' : 'rgba(80,255,80,0.12)';
-        context.lineWidth = 1.5; context.stroke();
-    }
-    Render.endViewTransform(render);
-
-    // === STATE & REWARD ===
-    const state = getStateVector(car, radarInputs, trackSegments);
-    const reward = calculateReward(car, state[4], state[5]);
-
-    // === TRAIN ===
-    if (prevState !== null && prevAction !== null) {
+    // Train
+    if (prevState && prevAction !== null) {
         firstNet.remember(prevState, prevAction, reward, state);
         firstNet.train();
     }
 
-    // === DRIFT ===
+    // Drift
     if (secondNet.update(state, reward)) {
         const panel = document.getElementById('ui-panel');
         panel.style.boxShadow = "0 0 25px #ff3333";
@@ -506,7 +463,7 @@ Matter.Events.on(engine, 'afterUpdate', () => {
         secondNet.reset();
     }
 
-    // === ACT ===
+    // Act
     const action = firstNet.act(state);
     prevState = state; prevAction = action;
     const torque = 0.055;
@@ -518,22 +475,30 @@ Matter.Events.on(engine, 'afterUpdate', () => {
         Body.setAngularVelocity(car.wheelA, car.wheelA.angularVelocity - torque);
     }
 
-    // === EPISODE RESET ===
-    let ang = car.chassis.angle % (Math.PI * 2);
-    if (ang > Math.PI) ang -= Math.PI * 2;
-    if (ang < -Math.PI) ang += Math.PI * 2;
-    if (Math.abs(ang) > 2.4) flippedFrames++; else flippedFrames = 0;
-    if (Math.abs(car.chassis.velocity.x) < 0.8 && (state[4] > 0 || state[5] > 0)) stuckFrames++;
-    else stuckFrames = 0;
+    // Respawn
+    let a = car.chassis.angle % (Math.PI * 2);
+    if (a > Math.PI) a -= Math.PI * 2;
+    if (a < -Math.PI) a += Math.PI * 2;
+    if (Math.abs(a) > 2.4) flippedFrames++; else flippedFrames = 0;
+    if (Math.abs(car.chassis.velocity.x) < 0.8 && (cA || cB)) stuckFrames++; else stuckFrames = 0;
     if (flippedFrames > 60 || stuckFrames > 300 || carY > window.innerHeight * 3) respawnCar();
 
-    // === UI ===
+    // UI
     if (++frameCounter % 3 === 0) {
         document.getElementById('stat-epsilon').innerText = firstNet.epsilon.toFixed(3);
         document.getElementById('stat-reward').innerText = reward.toFixed(2);
         document.getElementById('stat-kl').innerText = secondNet.lastKL.toFixed(3);
         document.getElementById('stat-episode').innerText = episode;
         updateLiveChart(secondNet.lastKL, reward);
+        // Sensor HUD
+        const names = ['vx','vy','tilt','om','ax','ay','com'];
+        for (let i = 0; i < 7; i++) {
+            const v = state[i];
+            document.getElementById('s-' + names[i]).innerText = v.toFixed(2);
+            const bar = document.getElementById('b-' + names[i]);
+            bar.style.width = Math.abs(v) * 40 + 'px';
+            bar.style.background = v >= 0 ? '#33ccff' : '#ff6666';
+        }
     }
 });
 </script>
