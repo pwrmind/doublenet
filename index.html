@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>ML RL: Два мозга (Actor & Drift Detector)</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #1a1a1a; font-family: sans-serif; color: #fff; }
+        canvas { display: block; }
+        #ui-panel {
+            position: absolute; top: 15px; left: 15px;
+            background: rgba(0,0,0,0.85); padding: 15px;
+            border-radius: 8px; border: 1px solid #444; width: 340px; z-index: 10;
+            transition: box-shadow 0.3s;
+        }
+        h3 { margin: 0 0 10px 0; font-size: 16px; color: #4caf50; }
+        .btn {
+            background: #333; color: #fff; border: 1px solid #555;
+            padding: 8px 12px; margin-right: 5px; margin-bottom: 5px;
+            cursor: pointer; border-radius: 4px; font-weight: bold; transition: 0.2s;
+        }
+        .btn:hover { background: #555; }
+        .btn.active { background: #4caf50; border-color: #81c784; }
+        .stats-text { font-family: monospace; font-size: 12px; margin-top: 10px; line-height: 1.5; }
+        #chart-container {
+            position: absolute; bottom: 15px; left: 15px;
+            background: rgba(0,0,0,0.85); padding: 10px;
+            border-radius: 8px; border: 1px solid #444; z-index: 10;
+        }
+        #analytics-chart { background: #111; border: 1px solid #333; }
+        .legend { display: flex; justify-content: space-between; font-size: 11px; margin-top: 3px; font-family: monospace; }
+        .legend-drift { color: #ff3333; }
+        .legend-reward { color: #33ccff; }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
+</head>
+<body>
+
+<div id="ui-panel">
+    <h3>Управление Средой (Concept Drift)</h3>
+    <button id="btn-easy" class="btn active" onclick="changeEnvironment('easy')">Плавные холмы</button>
+    <button id="btn-hard" class="btn" onclick="changeEnvironment('hard')">Острые скалы</button>
+    <div class="stats-text">
+        <div>Режим: <span id="stat-mode" style="color:#4caf50; font-weight:bold;">Плавные холмы</span></div>
+        <div>Эпизод: <span id="stat-episode">0</span></div>
+        <div>Эпсилон: <span id="stat-epsilon">1.00</span></div>
+        <div>Награда: <span id="stat-reward">0.00</span></div>
+        <div>KL-Дивергенция: <span id="stat-kl">0.00</span></div>
+        <div id="stat-status" style="margin-top:5px; color:#aaa;">Сбор базового эталона...</div>
+    </div>
+</div>
+
+<div id="chart-container">
+    <canvas id="analytics-chart" width="400" height="120"></canvas>
+    <div class="legend">
+        <span class="legend-drift">🔴 Сдвиг (KL) [порог 1.5]</span>
+        <span class="legend-reward">🔵 Награда</span>
+    </div>
+</div>
+
+<script>
+const { Engine, Render, Runner, Bodies, Composite, Constraint, Body } = Matter;
+
+// === НАСТРОЙКИ СРЕДЫ ===
+let AMPLITUDE = 45;
+let FREQUENCY = 0.015;
+const SEGMENT_WIDTH = 40;
+const VIEW_DISTANCE = 35;
+const SEGMENT_THICKNESS = 20;
+
+function changeEnvironment(mode) {
+    document.getElementById('btn-easy').classList.remove('active');
+    document.getElementById('btn-hard').classList.remove('active');
+    if (mode === 'easy') {
+        AMPLITUDE = 45; FREQUENCY = 0.015;
+        document.getElementById('btn-easy').classList.add('active');
+        document.getElementById('stat-mode').innerText = "Плавные холмы";
+        document.getElementById('stat-mode').style.color = "#4caf50";
+    } else {
+        AMPLITUDE = 180; FREQUENCY = 0.03;
+        document.getElementById('btn-hard').classList.add('active');
+        document.getElementById('stat-mode').innerText = "Острые скалы!";
+        document.getElementById('stat-mode').style.color = "#ff3333";
+    }
+}
+
+// === MATTER.JS ===
+const engine = Engine.create();
+const world = engine.world;
+const render = Render.create({
+    element: document.body, engine,
+    options: { width: window.innerWidth, height: window.innerHeight, wireframes: false, background: '#222' }
+});
+Render.run(render);
+Runner.run(Runner.create(), engine);
+
+// === ТРАССА ===
+const trackSegments = new Map();
+function getTerrainHeight(idx) {
+    return window.innerHeight * 0.65 + Math.sin(idx * SEGMENT_WIDTH * FREQUENCY) * AMPLITUDE;
+}
+function updateTrack(carX) {
+    const carIdx = Math.floor(carX / SEGMENT_WIDTH);
+    const startIdx = carIdx - VIEW_DISTANCE;
+    const endIdx = carIdx + VIEW_DISTANCE;
+    for (let i = startIdx; i <= endIdx; i++) {
+        if (!trackSegments.has(i)) {
+            const x = i * SEGMENT_WIDTH + SEGMENT_WIDTH / 2;
+            const y1 = getTerrainHeight(i);
+            const y2 = getTerrainHeight(i + 1);
+            const angle = Math.atan2(y2 - y1, SEGMENT_WIDTH);
+            const midY = (y1 + y2) / 2;
+            const seg = Bodies.rectangle(x, midY + SEGMENT_THICKNESS / 2, SEGMENT_WIDTH + 2, SEGMENT_THICKNESS, {
+                isStatic: true, friction: 0.8, render: { fillStyle: '#4caf50' }
+            });
+            Body.setAngle(seg, angle);
+            trackSegments.set(i, seg);
+            Composite.add(world, seg);
+        }
+    }
+    const toDelete = [];
+    for (let [index] of trackSegments.entries()) {
+        if (index < startIdx || index > endIdx) toDelete.push(index);
+    }
+    for (let index of toDelete) {
+        Composite.remove(world, trackSegments.get(index));
+        trackSegments.delete(index);
+    }
+}
+
+// === МАШИНА ===
+function createCar(x, y) {
+    const carWidth = 90, carHeight = 35, wheelRadius = 18;
+    const carGroup = Body.nextGroup(true); // ЕДИНАЯ группа — фикс бага №5
+    const chassis = Bodies.rectangle(x, y, carWidth, carHeight, {
+        collisionFilter: { group: carGroup }, density: 0.001, render: { fillStyle: '#ff5722' }
+    });
+    const wheelA = Bodies.circle(x - carWidth / 2 + 10, y + carHeight / 2, wheelRadius, {
+        collisionFilter: { group: carGroup }, friction: 0.9, render: { fillStyle: '#333' }
+    });
+    const wheelB = Bodies.circle(x + carWidth / 2 - 10, y + carHeight / 2, wheelRadius, {
+        collisionFilter: { group: carGroup }, friction: 0.9, render: { fillStyle: '#333' }
+    });
+    const springA = Constraint.create({
+        bodyA: chassis, pointA: { x: -carWidth / 2 + 10, y: carHeight / 2 },
+        bodyB: wheelA, stiffness: 0.4, render: { strokeStyle: '#fff', lineWidth: 1 }
+    });
+    const springB = Constraint.create({
+        bodyA: chassis, pointA: { x: carWidth / 2 - 10, y: carHeight / 2 },
+        bodyB: wheelB, stiffness: 0.4, render: { strokeStyle: '#fff', lineWidth: 1 }
+    });
+    Composite.add(world, [chassis, wheelA, wheelB, springA, springB]);
+    return { chassis, wheelA, wheelB, carWidth, carHeight };
+}
+const car = createCar(100, getTerrainHeight(0) - 100);
+
+// === УТИЛИТЫ ===
+const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+
+function raySegIntersect(px, py, dx, dy, ax, ay, bx, by) {
+    const ex = bx - ax, ey = by - ay;
+    const det = dy * ex - dx * ey;
+    if (Math.abs(det) < 1e-10) return -1;
+    const t = ((px - ax) * ey + (ay - py) * ex) / det;
+    const u = (dx * (ay - py) - dy * (ax - px)) / det;
+    if (t >= 0 && u >= 0 && u <= 1) return t;
+    return -1;
+}
+
+// === STATE ===
+function getStateVector(car, radarInputs, trackSegments) {
+    const c = car.chassis;
+    const velocityX = clamp(c.velocity.x / 20, -1, 1);
+    const velocityY = clamp(c.velocity.y / 20, -1, 1);
+    const normAngle = clamp(c.angle / Math.PI, -1, 1);
+    const angularVelocity = clamp(c.angularVelocity / 0.5, -1, 1);
+    const roadBodies = Array.from(trackSegments.values());
+    const contactA = Matter.Query.collides(car.wheelA, roadBodies).length > 0 ? 1.0 : 0.0;
+    const contactB = Matter.Query.collides(car.wheelB, roadBodies).length > 0 ? 1.0 : 0.0;
+    return [velocityX, velocityY, normAngle, angularVelocity, contactA, contactB, ...radarInputs];
+}
+
+// === REWARD ===
+function calculateReward(car, contactA, contactB) {
+    const c = car.chassis;
+    let reward = 0;
+    if (c.velocity.x > 0) reward += c.velocity.x * 0.1;
+    else reward -= 0.1;
+    let angle = c.angle % (Math.PI * 2);
+    if (angle > Math.PI) angle -= Math.PI * 2;
+    if (angle < -Math.PI) angle += Math.PI * 2;
+    const absAngle = Math.abs(angle);
+    if (absAngle > 1.3) reward -= (absAngle - 1.3) * 3.0;
+    if (absAngle > 2.5) reward -= 7.0;
+    if (contactA > 0 || contactB > 0) reward += 0.1;
+    if (contactA > 0 && contactB > 0) reward += 0.15;
+    return clamp(reward, -10, 10);
+}
+
+// === CONCEPT DRIFT DETECTOR ===
+class ConceptDriftDetector {
+    constructor(threshold = 1.5) {
+        this.threshold = threshold;
+        this.referenceWindow = []; this.currentWindow = [];
+        this.REF_MAX_SIZE = 800; this.CUR_MAX_SIZE = 120;
+        this.isStable = false; this.lastKL = 0;
+    }
+    update(stateVector, reward) {
+        const radars = stateVector.slice(6);
+        const avgRadar = radars.reduce((a, b) => a + b, 0) / radars.length;
+        const features = [avgRadar, reward];
+        this.currentWindow.push(features);
+        if (this.currentWindow.length > this.CUR_MAX_SIZE) this.currentWindow.shift();
+        if (!this.isStable) {
+            this.referenceWindow.push(features);
+            if (this.referenceWindow.length >= this.REF_MAX_SIZE) {
+                this.isStable = true;
+                const el = document.getElementById('stat-status');
+                el.innerText = "✅ Базовый профиль готов";
+                el.style.color = "#4caf50";
+            }
+            return false;
+        }
+        return this.checkDrift();
+    }
+    getStats(windowData, featureIdx) {
+        if (windowData.length === 0) return { mean: 0, sigma: 1 };
+        const values = windowData.map(d => d[featureIdx]);
+        const mean = values.reduce((a, b) => a + b, 0) / values.length;
+        const variance = values.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / values.length;
+        return { mean, sigma: Math.sqrt(variance) + 1e-5 };
+    }
+    checkDrift() {
+        const refR = this.getStats(this.referenceWindow, 0);
+        const curR = this.getStats(this.currentWindow, 0);
+        let kl = Math.log(curR.sigma / refR.sigma) +
+                 (refR.sigma ** 2 + (refR.mean - curR.mean) ** 2) / (2 * curR.sigma ** 2) - 0.5;
+        if (!isFinite(kl) || kl < 0) kl = 0;
+        this.lastKL = kl;
+        const refRw = this.getStats(this.referenceWindow, 1);
+        const curRw = this.getStats(this.currentWindow, 1);
+        const klTrigger = kl > this.threshold;
+        const rewardTrigger = refRw.mean > 0.5 && curRw.mean < refRw.mean * 0.4;
+        if (klTrigger || rewardTrigger) return true;
+        if (this.referenceWindow.length >= this.REF_MAX_SIZE) this.referenceWindow.shift();
+        this.referenceWindow.push(this.currentWindow[this.currentWindow.length - 1]);
+        return false;
+    }
+    reset() {
+        this.referenceWindow = []; this.currentWindow = [];
+        this.isStable = false; this.lastKL = 0;
+        const el = document.getElementById('stat-status');
+        el.innerText = "🔄 Детекция! Новый эталон...";
+        el.style.color = "#ff9800";
+    }
+}
+
+// === DQN С СКРЫТЫМ СЛОЕМ + TARGET NETWORK ===
+class FirstNetworkDQN {
+    constructor(inputSize = 11, hiddenSize = 24, actionSize = 3) {
+        this.inputSize = inputSize; this.hiddenSize = hiddenSize; this.actionSize = actionSize;
+        this.gamma = 0.95; this.epsilon = 1.0; this.epsilonMin = 0.03;
+        this.epsilonDecay = 0.9995; this.lr = 0.01;
+        const lim1 = Math.sqrt(6 / inputSize), lim2 = Math.sqrt(6 / hiddenSize);
+        this.W1 = Array.from({length: inputSize}, () =>
+            Array.from({length: hiddenSize}, () => (Math.random() * 2 - 1) * lim1));
+        this.b1 = new Array(hiddenSize).fill(0);
+        this.W2 = Array.from({length: hiddenSize}, () =>
+            Array.from({length: actionSize}, () => (Math.random() * 2 - 1) * lim2));
+        this.b2 = new Array(actionSize).fill(0);
+        this.W1t = this.W1.map(r => [...r]); this.b1t = [...this.b1];
+        this.W2t = this.W2.map(r => [...r]); this.b2t = [...this.b2];
+        this.stepsSinceSync = 0; this.SYNC_EVERY = 200;
+        this.memory = []; this.MEMORY_MAX = 2000; this.BATCH_SIZE = 32;
+        this._h = new Array(hiddenSize).fill(0);
+        this._h_pre = new Array(hiddenSize).fill(0);
+    }
+    _forward(s) {
+        for (let i = 0; i < this.hiddenSize; i++) {
+            let v = this.b1[i];
+            for (let j = 0; j < this.inputSize; j++) v += s[j] * this.W1[j][i];
+            this._h_pre[i] = v;
+            this._h[i] = v > 0 ? v : 0;
+        }
+        const q = new Array(this.actionSize);
+        for (let a = 0; a < this.actionSize; a++) {
+            let v = this.b2[a];
+            for (let i = 0; i < this.hiddenSize; i++) v += this._h[i] * this.W2[i][a];
+            q[a] = v;
+        }
+        return q;
+    }
+    _forwardTarget(s) {
+        const h = new Array(this.hiddenSize);
+        for (let i = 0; i < this.hiddenSize; i++) {
+            let v = this.b1t[i];
+            for (let j = 0; j < this.inputSize; j++) v += s[j] * this.W1t[j][i];
+            h[i] = v > 0 ? v : 0;
+        }
+        const q = new Array(this.actionSize);
+        for (let a = 0; a < this.actionSize; a++) {
+            let v = this.b2t[a];
+            for (let i = 0; i < this.hiddenSize; i++) v += h[i] * this.W2t[i][a];
+            q[a] = v;
+        }
+        return q;
+    }
+    act(s) {
+        if (Math.random() < this.epsilon) return Math.floor(Math.random() * this.actionSize);
+        const q = this._forward(s);
+        let best = 0;
+        for (let a = 1; a < this.actionSize; a++) if (q[a] > q[best]) best = a;
+        return best;
+    }
+    remember(s, a, r, ns) {
+        this.memory.push({ state: [...s], action: a, reward: r, nextState: [...ns] });
+        if (this.memory.length > this.MEMORY_MAX) this.memory.shift();
+    }
+    train() {
+        if (this.memory.length < this.BATCH_SIZE) return;
+        for (let b = 0; b < this.BATCH_SIZE; b++) {
+            const { state, action, reward, nextState } = this.memory[Math.floor(Math.random() * this.memory.length)];
+            const q = this._forward(state);
+            const nextQ = this._forwardTarget(nextState);
+            const target = reward + this.gamma * Math.max(...nextQ);
+            let error = clamp(target - q[action], -1, 1);
+            if (!isFinite(error)) continue;
+            const dh = new Array(this.hiddenSize);
+            for (let i = 0; i < this.hiddenSize; i++)
+                dh[i] = error * this.W2[i][action] * (this._h_pre[i] > 0 ? 1 : 0);
+            for (let i = 0; i < this.hiddenSize; i++)
+                this.W2[i][action] += this.lr * error * this._h[i];
+            this.b2[action] += this.lr * error;
+            for (let i = 0; i < this.hiddenSize; i++) {
+                for (let j = 0; j < this.inputSize; j++) this.W1[j][i] += this.lr * dh[i] * state[j];
+                this.b1[i] += this.lr * dh[i];
+            }
+        }
+        if (this.epsilon > this.epsilonMin) this.epsilon *= this.epsilonDecay;
+        if (++this.stepsSinceSync >= this.SYNC_EVERY) { this.syncTarget(); this.stepsSinceSync = 0; }
+    }
+    syncTarget() {
+        for (let j = 0; j < this.inputSize; j++)
+            for (let i = 0; i < this.hiddenSize; i++) this.W1t[j][i] = this.W1[j][i];
+        for (let i = 0; i < this.hiddenSize; i++) this.b1t[i] = this.b1[i];
+        for (let i = 0; i < this.hiddenSize; i++)
+            for (let a = 0; a < this.actionSize; a++) this.W2t[i][a] = this.W2[i][a];
+        for (let a = 0; a < this.actionSize; a++) this.b2t[a] = this.b2[a];
+    }
+    triggerRelearning() {
+        this.epsilon = 0.7; this.lr = 0.02; this.memory = [];
+        this.syncTarget();
+    }
+}
+
+const firstNet = new FirstNetworkDQN();
+const secondNet = new ConceptDriftDetector(1.5);
+let prevState = null, prevAction = null;
+
+// === ГРАФИК ===
+const chartCanvas = document.getElementById('analytics-chart');
+const chartCtx = chartCanvas.getContext('2d');
+const driftHistory = [], rewardHistory = [];
+function updateLiveChart(kl, reward) {
+    driftHistory.push(kl); rewardHistory.push(reward);
+    if (driftHistory.length > chartCanvas.width) { driftHistory.shift(); rewardHistory.shift(); }
+    chartCtx.clearRect(0, 0, chartCanvas.width, chartCanvas.height);
+    const thY = chartCanvas.height - 15 - 1.5 * 18;
+    chartCtx.beginPath(); chartCtx.strokeStyle = 'rgba(255,0,0,0.35)';
+    chartCtx.setLineDash([4,4]); chartCtx.moveTo(0, thY); chartCtx.lineTo(chartCanvas.width, thY);
+    chartCtx.stroke(); chartCtx.setLineDash([]);
+    chartCtx.beginPath(); chartCtx.strokeStyle = '#ff3333'; chartCtx.lineWidth = 2;
+    for (let i = 0; i < driftHistory.length; i++) {
+        const y = chartCanvas.height - 15 - Math.min(driftHistory[i], 5) * 18;
+        i === 0 ? chartCtx.moveTo(i, y) : chartCtx.lineTo(i, y);
+    }
+    chartCtx.stroke();
+    chartCtx.beginPath(); chartCtx.strokeStyle = '#33ccff'; chartCtx.lineWidth = 1.5;
+    for (let i = 0; i < rewardHistory.length; i++) {
+        const y = chartCanvas.height / 2 - rewardHistory[i] * 8;
+        i === 0 ? chartCtx.moveTo(i, y) : chartCtx.lineTo(i, y);
+    }
+    chartCtx.stroke();
+}
+
+// === ЭПИЗОДЫ ===
+let episode = 0, flippedFrames = 0, stuckFrames = 0, frameCounter = 0;
+function respawnCar() {
+    const newX = car.chassis.position.x + 100;
+    const newY = getTerrainHeight(Math.floor(newX / SEGMENT_WIDTH)) - 150;
+    Body.setPosition(car.chassis, { x: newX, y: newY });
+    Body.setVelocity(car.chassis, { x: 0, y: 0 });
+    Body.setAngularVelocity(car.chassis, 0);
+    Body.setAngle(car.chassis, 0);
+    Body.setPosition(car.wheelA, { x: newX - 35, y: newY + 35 });
+    Body.setPosition(car.wheelB, { x: newX + 35, y: newY + 35 });
+    Body.setVelocity(car.wheelA, { x: 0, y: 0 });
+    Body.setVelocity(car.wheelB, { x: 0, y: 0 });
+    Body.setAngularVelocity(car.wheelA, 0);
+    Body.setAngularVelocity(car.wheelB, 0);
+    flippedFrames = 0; stuckFrames = 0; episode++;
+}
+
+// === ИГРОВОЙ ЦИКЛ ===
+const RADAR_COUNT = 5, RADAR_LENGTH = 280, RADAR_FOV = 60;
+
+Matter.Events.on(engine, 'afterUpdate', () => {
+    const carX = car.chassis.position.x, carY = car.chassis.position.y;
+    updateTrack(carX);
+    Render.lookAt(render, {
+        min: { x: carX - window.innerWidth / 2, y: carY - window.innerHeight * 0.7 },
+        max: { x: carX + window.innerWidth / 2, y: carY + window.innerHeight * 0.3 }
+    });
+
+    // === RAYCAST ===
+    const radarInputs = [];
+    const context = render.context;
+    Render.startViewTransform(render);
+    for (let i = 0; i < RADAR_COUNT; i++) {
+        const frac = RADAR_COUNT > 1 ? i / (RADAR_COUNT - 1) : 0.5;
+        const angle = car.chassis.angle + ((frac * RADAR_FOV) - RADAR_FOV / 2) * (Math.PI / 180) + Math.PI / 6;
+        const dx = Math.cos(angle), dy = Math.sin(angle);
+        let minFrac = 1.0;
+        for (let seg of trackSegments.values()) {
+            const verts = seg.vertices;
+            for (let k = 0; k < verts.length; k++) {
+                const a = verts[k], b = verts[(k + 1) % verts.length];
+                const t = raySegIntersect(carX, carY, dx, dy, a.x, a.y, b.x, b.y);
+                if (t >= 0 && t < minFrac * RADAR_LENGTH) minFrac = t / RADAR_LENGTH;
+            }
+        }
+        radarInputs.push(minFrac);
+        const endX = carX + dx * minFrac * RADAR_LENGTH;
+        const endY = carY + dy * minFrac * RADAR_LENGTH;
+        context.beginPath(); context.moveTo(carX, carY); context.lineTo(endX, endY);
+        context.strokeStyle = minFrac < 1 ? 'rgba(255,0,0,0.45)' : 'rgba(0,255,0,0.15)';
+        context.lineWidth = 1.5; context.stroke();
+    }
+    Render.endViewTransform(render);
+
+    // === STATE & REWARD ===
+    const state = getStateVector(car, radarInputs, trackSegments);
+    const reward = calculateReward(car, state[4], state[5]);
+
+    // === TRAIN ===
+    if (prevState !== null && prevAction !== null) {
+        firstNet.remember(prevState, prevAction, reward, state);
+        firstNet.train();
+    }
+
+    // === DRIFT ===
+    if (secondNet.update(state, reward)) {
+        const panel = document.getElementById('ui-panel');
+        panel.style.boxShadow = "0 0 25px #ff3333";
+        setTimeout(() => panel.style.boxShadow = "none", 1000);
+        firstNet.triggerRelearning();
+        secondNet.reset();
+    }
+
+    // === ACT ===
+    const action = firstNet.act(state);
+    prevState = state; prevAction = action;
+    const torque = 0.055;
+    if (action === 2) {
+        Body.setAngularVelocity(car.wheelB, car.wheelB.angularVelocity + torque);
+        Body.setAngularVelocity(car.wheelA, car.wheelA.angularVelocity + torque);
+    } else if (action === 0) {
+        Body.setAngularVelocity(car.wheelB, car.wheelB.angularVelocity - torque);
+        Body.setAngularVelocity(car.wheelA, car.wheelA.angularVelocity - torque);
+    }
+
+    // === EPISODE RESET ===
+    let ang = car.chassis.angle % (Math.PI * 2);
+    if (ang > Math.PI) ang -= Math.PI * 2;
+    if (ang < -Math.PI) ang += Math.PI * 2;
+    const absAng = Math.abs(ang);
+    if (absAng > 2.4) flippedFrames++; else flippedFrames = 0;
+    if (Math.abs(car.chassis.velocity.x) < 0.8 && (state[4] > 0 || state[5] > 0)) stuckFrames++;
+    else stuckFrames = 0;
+    if (flippedFrames > 60 || stuckFrames > 300 || carY > window.innerHeight * 3) respawnCar();
+
+    // === UI (по счётчику кадров — фикс бага №6) ===
+    if (++frameCounter % 3 === 0) {
+        document.getElementById('stat-epsilon').innerText = firstNet.epsilon.toFixed(3);
+        document.getElementById('stat-reward').innerText = reward.toFixed(2);
+        document.getElementById('stat-kl').innerText = secondNet.lastKL.toFixed(3);
+        document.getElementById('stat-episode').innerText = episode;
+        updateLiveChart(secondNet.lastKL, reward);
+    }
+});
+</script>
+</body>
+</html>
