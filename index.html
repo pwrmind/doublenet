@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <title>ML RL: Два мозга (Actor & Drift Detector)</title>
+    <title>ML RL: Double DQN + 2-way radars</title>
     <style>
         body { margin: 0; overflow: hidden; background: #1a1a1a; font-family: sans-serif; color: #fff; }
         canvas { display: block; }
@@ -44,7 +44,7 @@
         <div>Эпизод: <span id="stat-episode">0</span></div>
         <div>Эпсилон: <span id="stat-epsilon">1.00</span></div>
         <div>Награда: <span id="stat-reward">0.00</span></div>
-        <div>KL-Дивергенция: <span id="stat-kl">0.00</span></div>
+        <div>KL (max front/back): <span id="stat-kl">0.00</span></div>
         <div id="stat-status" style="margin-top:5px; color:#aaa;">Сбор базового эталона...</div>
     </div>
 </div>
@@ -130,7 +130,7 @@ function updateTrack(carX) {
 // === МАШИНА ===
 function createCar(x, y) {
     const carWidth = 90, carHeight = 35, wheelRadius = 18;
-    const carGroup = Body.nextGroup(true); // ЕДИНАЯ группа — фикс бага №5
+    const carGroup = Body.nextGroup(true);
     const chassis = Bodies.rectangle(x, y, carWidth, carHeight, {
         collisionFilter: { group: carGroup }, density: 0.001, render: { fillStyle: '#ff5722' }
     });
@@ -149,7 +149,7 @@ function createCar(x, y) {
         bodyB: wheelB, stiffness: 0.4, render: { strokeStyle: '#fff', lineWidth: 1 }
     });
     Composite.add(world, [chassis, wheelA, wheelB, springA, springB]);
-    return { chassis, wheelA, wheelB, carWidth, carHeight };
+    return { chassis, wheelA, wheelB };
 }
 const car = createCar(100, getTerrainHeight(0) - 100);
 
@@ -166,7 +166,7 @@ function raySegIntersect(px, py, dx, dy, ax, ay, bx, by) {
     return -1;
 }
 
-// === STATE ===
+// === STATE (теперь 16 элементов: 6 физика + 5 передних + 5 задних) ===
 function getStateVector(car, radarInputs, trackSegments) {
     const c = car.chassis;
     const velocityX = clamp(c.velocity.x / 20, -1, 1);
@@ -196,7 +196,7 @@ function calculateReward(car, contactA, contactB) {
     return clamp(reward, -10, 10);
 }
 
-// === CONCEPT DRIFT DETECTOR ===
+// === ДЕТЕКТОР ДРЕЙФА (3 признака: front-avg, back-avg, reward) ===
 class ConceptDriftDetector {
     constructor(threshold = 1.5) {
         this.threshold = threshold;
@@ -205,9 +205,11 @@ class ConceptDriftDetector {
         this.isStable = false; this.lastKL = 0;
     }
     update(stateVector, reward) {
-        const radars = stateVector.slice(6);
-        const avgRadar = radars.reduce((a, b) => a + b, 0) / radars.length;
-        const features = [avgRadar, reward];
+        // Вектор: [0..5] физика, [6..10] передние радары, [11..15] задние
+        let frontSum = 0, backSum = 0;
+        for (let i = 6; i <= 10; i++) frontSum += stateVector[i];
+        for (let i = 11; i <= 15; i++) backSum += stateVector[i];
+        const features = [frontSum / 5, backSum / 5, reward];
         this.currentWindow.push(features);
         if (this.currentWindow.length > this.CUR_MAX_SIZE) this.currentWindow.shift();
         if (!this.isStable) {
@@ -229,16 +231,22 @@ class ConceptDriftDetector {
         const variance = values.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / values.length;
         return { mean, sigma: Math.sqrt(variance) + 1e-5 };
     }
+    _klNormal(ref, cur) {
+        let kl = Math.log(cur.sigma / ref.sigma) +
+                 (ref.sigma ** 2 + (ref.mean - cur.mean) ** 2) / (2 * cur.sigma ** 2) - 0.5;
+        return (isFinite(kl) && kl > 0) ? kl : 0;
+    }
     checkDrift() {
-        const refR = this.getStats(this.referenceWindow, 0);
-        const curR = this.getStats(this.currentWindow, 0);
-        let kl = Math.log(curR.sigma / refR.sigma) +
-                 (refR.sigma ** 2 + (refR.mean - curR.mean) ** 2) / (2 * curR.sigma ** 2) - 0.5;
-        if (!isFinite(kl) || kl < 0) kl = 0;
-        this.lastKL = kl;
-        const refRw = this.getStats(this.referenceWindow, 1);
-        const curRw = this.getStats(this.currentWindow, 1);
-        const klTrigger = kl > this.threshold;
+        const refF = this.getStats(this.referenceWindow, 0);
+        const curF = this.getStats(this.currentWindow, 0);
+        const refB = this.getStats(this.referenceWindow, 1);
+        const curB = this.getStats(this.currentWindow, 1);
+        const klF = this._klNormal(refF, curF);
+        const klB = this._klNormal(refB, curB);
+        this.lastKL = Math.max(klF, klB);
+        const refRw = this.getStats(this.referenceWindow, 2);
+        const curRw = this.getStats(this.currentWindow, 2);
+        const klTrigger = this.lastKL > this.threshold;
         const rewardTrigger = refRw.mean > 0.5 && curRw.mean < refRw.mean * 0.4;
         if (klTrigger || rewardTrigger) return true;
         if (this.referenceWindow.length >= this.REF_MAX_SIZE) this.referenceWindow.shift();
@@ -254,9 +262,9 @@ class ConceptDriftDetector {
     }
 }
 
-// === DQN С СКРЫТЫМ СЛОЕМ + TARGET NETWORK ===
+// === DOUBLE DQN (16 входов, hidden=32) ===
 class FirstNetworkDQN {
-    constructor(inputSize = 11, hiddenSize = 24, actionSize = 3) {
+    constructor(inputSize = 16, hiddenSize = 32, actionSize = 3) {
         this.inputSize = inputSize; this.hiddenSize = hiddenSize; this.actionSize = actionSize;
         this.gamma = 0.95; this.epsilon = 1.0; this.epsilonMin = 0.03;
         this.epsilonDecay = 0.9995; this.lr = 0.01;
@@ -267,6 +275,7 @@ class FirstNetworkDQN {
         this.W2 = Array.from({length: hiddenSize}, () =>
             Array.from({length: actionSize}, () => (Math.random() * 2 - 1) * lim2));
         this.b2 = new Array(actionSize).fill(0);
+        // Target network (копия)
         this.W1t = this.W1.map(r => [...r]); this.b1t = [...this.b1];
         this.W2t = this.W2.map(r => [...r]); this.b2t = [...this.b2];
         this.stepsSinceSync = 0; this.SYNC_EVERY = 200;
@@ -318,12 +327,26 @@ class FirstNetworkDQN {
     train() {
         if (this.memory.length < this.BATCH_SIZE) return;
         for (let b = 0; b < this.BATCH_SIZE; b++) {
-            const { state, action, reward, nextState } = this.memory[Math.floor(Math.random() * this.memory.length)];
+            const { state, action, reward, nextState } =
+                this.memory[Math.floor(Math.random() * this.memory.length)];
+
+            // === DOUBLE DQN ===
+            // 1) Основная сеть выбирает лучшее действие
+            const nextQOnline = this._forward(nextState);
+            let bestNextAction = 0;
+            for (let a = 1; a < this.actionSize; a++) {
+                if (nextQOnline[a] > nextQOnline[bestNextAction]) bestNextAction = a;
+            }
+            // 2) Target сеть оценивает это действие
+            const nextQTarget = this._forwardTarget(nextState);
+            const target = reward + this.gamma * nextQTarget[bestNextAction];
+
+            // 3) Прямой проход текущей сети (кэширует _h, _h_pre для state)
             const q = this._forward(state);
-            const nextQ = this._forwardTarget(nextState);
-            const target = reward + this.gamma * Math.max(...nextQ);
             let error = clamp(target - q[action], -1, 1);
             if (!isFinite(error)) continue;
+
+            // 4) Backprop
             const dh = new Array(this.hiddenSize);
             for (let i = 0; i < this.hiddenSize; i++)
                 dh[i] = error * this.W2[i][action] * (this._h_pre[i] > 0 ? 1 : 0);
@@ -331,7 +354,8 @@ class FirstNetworkDQN {
                 this.W2[i][action] += this.lr * error * this._h[i];
             this.b2[action] += this.lr * error;
             for (let i = 0; i < this.hiddenSize; i++) {
-                for (let j = 0; j < this.inputSize; j++) this.W1[j][i] += this.lr * dh[i] * state[j];
+                for (let j = 0; j < this.inputSize; j++)
+                    this.W1[j][i] += this.lr * dh[i] * state[j];
                 this.b1[i] += this.lr * dh[i];
             }
         }
@@ -400,24 +424,29 @@ function respawnCar() {
     flippedFrames = 0; stuckFrames = 0; episode++;
 }
 
-// === ИГРОВОЙ ЦИКЛ ===
-const RADAR_COUNT = 5, RADAR_LENGTH = 280, RADAR_FOV = 60;
+// === РАДАРЫ ===
+const FRONT_RADAR_COUNT = 5;
+const BACK_RADAR_COUNT = 5;
+const RADAR_LENGTH = 280;
+const RADAR_FOV = 60;
+const FOV_RAD = RADAR_FOV * Math.PI / 180;
 
+// === ИГРОВОЙ ЦИКЛ ===
 Matter.Events.on(engine, 'afterUpdate', () => {
     const carX = car.chassis.position.x, carY = car.chassis.position.y;
+    const carAngle = car.chassis.angle;
     updateTrack(carX);
     Render.lookAt(render, {
         min: { x: carX - window.innerWidth / 2, y: carY - window.innerHeight * 0.7 },
         max: { x: carX + window.innerWidth / 2, y: carY + window.innerHeight * 0.3 }
     });
 
-    // === RAYCAST ===
+    // === RAYCAST: 5 передних + 5 задних ===
     const radarInputs = [];
     const context = render.context;
     Render.startViewTransform(render);
-    for (let i = 0; i < RADAR_COUNT; i++) {
-        const frac = RADAR_COUNT > 1 ? i / (RADAR_COUNT - 1) : 0.5;
-        const angle = car.chassis.angle + ((frac * RADAR_FOV) - RADAR_FOV / 2) * (Math.PI / 180) + Math.PI / 6;
+
+    const castRay = (angle) => {
         const dx = Math.cos(angle), dy = Math.sin(angle);
         let minFrac = 1.0;
         for (let seg of trackSegments.values()) {
@@ -428,11 +457,32 @@ Matter.Events.on(engine, 'afterUpdate', () => {
                 if (t >= 0 && t < minFrac * RADAR_LENGTH) minFrac = t / RADAR_LENGTH;
             }
         }
-        radarInputs.push(minFrac);
-        const endX = carX + dx * minFrac * RADAR_LENGTH;
-        const endY = carY + dy * minFrac * RADAR_LENGTH;
-        context.beginPath(); context.moveTo(carX, carY); context.lineTo(endX, endY);
-        context.strokeStyle = minFrac < 1 ? 'rgba(255,0,0,0.45)' : 'rgba(0,255,0,0.15)';
+        return { frac: minFrac, dx, dy };
+    };
+
+    // Передние: carAngle + spread + tilt_down
+    for (let i = 0; i < FRONT_RADAR_COUNT; i++) {
+        const local = (i / (FRONT_RADAR_COUNT - 1) - 0.5) * FOV_RAD;
+        const angle = carAngle + local + Math.PI / 6;
+        const { frac, dx, dy } = castRay(angle);
+        radarInputs.push(frac);
+        const ex = carX + dx * frac * RADAR_LENGTH;
+        const ey = carY + dy * frac * RADAR_LENGTH;
+        context.beginPath(); context.moveTo(carX, carY); context.lineTo(ex, ey);
+        context.strokeStyle = frac < 1 ? 'rgba(255,80,80,0.5)' : 'rgba(80,255,80,0.12)';
+        context.lineWidth = 1.5; context.stroke();
+    }
+
+    // Задние: carAngle + π − spread − tilt_down (зеркальное отражение)
+    for (let i = 0; i < BACK_RADAR_COUNT; i++) {
+        const local = (i / (BACK_RADAR_COUNT - 1) - 0.5) * FOV_RAD;
+        const angle = carAngle + Math.PI - local - Math.PI / 6;
+        const { frac, dx, dy } = castRay(angle);
+        radarInputs.push(frac);
+        const ex = carX + dx * frac * RADAR_LENGTH;
+        const ey = carY + dy * frac * RADAR_LENGTH;
+        context.beginPath(); context.moveTo(carX, carY); context.lineTo(ex, ey);
+        context.strokeStyle = frac < 1 ? 'rgba(80,160,255,0.5)' : 'rgba(80,255,80,0.12)';
         context.lineWidth = 1.5; context.stroke();
     }
     Render.endViewTransform(render);
@@ -472,13 +522,12 @@ Matter.Events.on(engine, 'afterUpdate', () => {
     let ang = car.chassis.angle % (Math.PI * 2);
     if (ang > Math.PI) ang -= Math.PI * 2;
     if (ang < -Math.PI) ang += Math.PI * 2;
-    const absAng = Math.abs(ang);
-    if (absAng > 2.4) flippedFrames++; else flippedFrames = 0;
+    if (Math.abs(ang) > 2.4) flippedFrames++; else flippedFrames = 0;
     if (Math.abs(car.chassis.velocity.x) < 0.8 && (state[4] > 0 || state[5] > 0)) stuckFrames++;
     else stuckFrames = 0;
     if (flippedFrames > 60 || stuckFrames > 300 || carY > window.innerHeight * 3) respawnCar();
 
-    // === UI (по счётчику кадров — фикс бага №6) ===
+    // === UI ===
     if (++frameCounter % 3 === 0) {
         document.getElementById('stat-epsilon').innerText = firstNet.epsilon.toFixed(3);
         document.getElementById('stat-reward').innerText = reward.toFixed(2);
